@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "*"
+    branches:
+      - "release/**"
   workflow_dispatch:
 
 permissions:
@@ -36,6 +38,13 @@ jobs:
             $prerelease = "false"
             $artifactName = "WinAiBuddy-${env:GITHUB_REF_NAME}-win-x64.zip"
             $releaseNotes = "Automated release for tag ${env:GITHUB_REF_NAME}."
+          }
+          elseif ("${env:GITHUB_REF_NAME}" -like "release/*") {
+            $tagName = "${env:GITHUB_REF_NAME}".Substring(8)
+            $releaseName = $tagName
+            $prerelease = "false"
+            $artifactName = "WinAiBuddy-$tagName-win-x64.zip"
+            $releaseNotes = "Automated release from branch ${env:GITHUB_REF_NAME}."
           }
           else {
             $tagName = "manual-${env:GITHUB_RUN_NUMBER}-$shortSha"
