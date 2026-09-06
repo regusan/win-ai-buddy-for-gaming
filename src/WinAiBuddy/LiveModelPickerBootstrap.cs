@@ -41,11 +41,10 @@ internal static class LiveModelPickerBootstrap
         var savedModel = ReadSavedModel();
         var currentModel = !string.IsNullOrWhiteSpace(savedModel)
             ? savedModel
-            : comboBox.SelectedItem?.ToString() ?? comboBox.Text;
+            : RecommendedModel;
 
         var models = KnownLiveModels.ToList();
-        if (!string.IsNullOrWhiteSpace(currentModel) &&
-            !models.Any(model => string.Equals(model, currentModel, StringComparison.OrdinalIgnoreCase)))
+        if (!models.Any(model => string.Equals(model, currentModel, StringComparison.OrdinalIgnoreCase)))
         {
             models.Insert(0, currentModel.Trim());
         }
@@ -118,7 +117,7 @@ internal static class LiveModelPickerBootstrap
         }
         catch
         {
-            // Keep the existing UI value if the settings file cannot be read.
+            // Keep the recommended default if the settings file cannot be read.
         }
 
         return string.Empty;
