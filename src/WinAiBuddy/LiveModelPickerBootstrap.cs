@@ -2,7 +2,7 @@ using System.IO;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Windows;
-using System.Windows.Controls;
+using WpfComboBox = System.Windows.Controls.ComboBox;
 
 namespace WinAiBuddy;
 
@@ -16,7 +16,7 @@ internal static class LiveModelPickerBootstrap
         "gemini-2.5-flash-native-audio-preview-12-2025"
     ];
 
-    private static readonly ConditionalWeakTable<ComboBox, object> ConfiguredPickers = new();
+    private static readonly ConditionalWeakTable<WpfComboBox, object> ConfiguredPickers = new();
 
     [ModuleInitializer]
     internal static void Initialize()
@@ -30,7 +30,7 @@ internal static class LiveModelPickerBootstrap
     private static void OnMainWindowLoaded(object sender, RoutedEventArgs e)
     {
         if (sender is not MainWindow window ||
-            window.FindName("LiveModelComboBox") is not ComboBox comboBox ||
+            window.FindName("LiveModelComboBox") is not WpfComboBox comboBox ||
             ConfiguredPickers.TryGetValue(comboBox, out _))
         {
             return;
@@ -65,7 +65,7 @@ internal static class LiveModelPickerBootstrap
         comboBox.LostKeyboardFocus += (_, _) => CommitTypedModel(comboBox);
     }
 
-    private static void CommitTypedModel(ComboBox comboBox)
+    private static void CommitTypedModel(WpfComboBox comboBox)
     {
         var typedModel = comboBox.Text?.Trim();
         if (string.IsNullOrWhiteSpace(typedModel))
