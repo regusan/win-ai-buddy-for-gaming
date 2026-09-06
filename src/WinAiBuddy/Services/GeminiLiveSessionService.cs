@@ -7,15 +7,19 @@ namespace WinAiBuddy.Services;
 
 public sealed class GeminiLiveSessionService : IAsyncDisposable
 {
-    private const int MaxBufferedRealtimeInputs = 1000;
-    private const string TransparentUnsupportedMessage = "transparent parameter is not supported";
+    private const int MaxReconnectAttempts = 5;
+    private const int RapidCloseLimit = 3;
+    private static readonly TimeSpan RapidCloseWindow = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan InterruptDebounce = TimeSpan.FromMilliseconds(250);
+    private const string InvalidArgumentMarker = "Request contains an invalid argument";
+
     private static readonly Regex DuplicateWhitespaceRegex = new(@"\s{2,}", RegexOptions.Compiled);
     private static readonly Regex PunctuationSpacingRegex = new(@"(?<=[,!?;:.])(?=\p{L})", RegexOptions.Compiled);
 
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private readonly SemaphoreSlim _reconnectLock = new(1, 1);
     private readonly object _transcriptLock = new();
-    private readonly object _bufferLock = new();
+    private readonly object _resumptionLock = new();
     private readonly DiagnosticsLogService _diagnosticsLogService;
 
     private Client? _client;
@@ -23,39 +27,28 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
     private CancellationTokenSource? _receiveLoopCts;
     private CancellationTokenSource? _serviceLifetimeCts;
     private Task? _receiveLoopTask;
-
     private AppSettings? _activeSettings;
     private string? _sessionResumptionHandle;
-    private long _nextClientMessageIndex;
-    private long _lastConsumedClientMessageIndex = -1;
-    private bool _shouldBeRunning;
-    private bool _transparentResumptionEnabled = true;
-    private int _recoveryInFlight;
 
-    private readonly List<BufferedRealtimeInput> _pendingRealtimeInputs = new();
+    private bool _shouldBeRunning;
+    private bool _googleSearchEnabled = true;
+    private int _recoveryInFlight;
+    private DateTime _connectedAt = DateTime.MinValue;
+    private int _rapidCloseCount;
+    private DateTime _lastInterruptedAt = DateTime.MinValue;
 
     private string _currentInputTranscript = string.Empty;
     private string _currentOutputTranscript = string.Empty;
     private DateTime _lastInputTranscriptAt = DateTime.MinValue;
     private DateTime _lastOutputTranscriptAt = DateTime.MinValue;
-    private DateTime _lastBufferedInputLogAt = DateTime.MinValue;
-    private DateTime _lastReceivedAudioLogAt = DateTime.MinValue;
     private bool _inputTurnOpen;
     private bool _outputTurnOpen;
-    private int _bufferedAudioChunksSinceLastLog;
-    private int _bufferedVideoFramesSinceLastLog;
-    private int _receivedAudioChunksSinceLastLog;
 
     public event Action<string>? StatusChanged;
-
     public event Action<bool>? SessionStateChanged;
-
     public event Action<string>? InputTranscriptionChanged;
-
     public event Action<string>? OutputTranscriptionChanged;
-
     public event Action<byte[]>? AudioReceived;
-
     public event Action? Interrupted;
 
     public GeminiLiveSessionService(DiagnosticsLogService diagnosticsLogService)
@@ -70,7 +63,7 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
     {
         await StopAsync(cancellationToken);
         ResetTranscriptState();
-        ClearRecoveryState();
+        ResetConnectionState();
 
         if (string.IsNullOrWhiteSpace(settings.ApiKey))
         {
@@ -80,9 +73,18 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
         _activeSettings = settings;
         _shouldBeRunning = true;
         _serviceLifetimeCts = new CancellationTokenSource();
-        ResetDiagnosticsCounters();
+
         var sessionLogPath = _diagnosticsLogService.StartSession(settings.LiveModel);
-        LogSession("Live", $"Start requested | model={settings.LiveModel} | voice={settings.Voice} | streamScreen={settings.StreamScreenFrames} | restoredTurns={restoredConversation?.Count ?? 0} | log={sessionLogPath}");
+        LogSession(
+            "Live",
+            $"Start requested | model={settings.LiveModel} | voice={settings.Voice} | streamScreen={settings.StreamScreenFrames} | restoredTurns={restoredConversation?.Count ?? 0} | log={sessionLogPath}");
+
+        if (IsGemini31Live(settings.LiveModel) && IsThinkingDisabled(settings))
+        {
+            LogSession(
+                "Compat",
+                "Gemini 3.1 Live uses thinkingLevel instead of thinkingBudget. Disabled is mapped to minimal for lowest latency.");
+        }
 
         await ConnectAsync(settings, allowResumption: false, cancellationToken);
 
@@ -97,44 +99,51 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
 
     public async Task SendAudioChunkAsync(AudioChunk chunk, CancellationToken cancellationToken = default)
     {
-        if (!_shouldBeRunning)
-        {
-            return;
-        }
-
-        var buffered = BufferAudio(chunk);
         var session = _session;
-        if (session is null)
+        if (!_shouldBeRunning || session is null)
         {
-            QueueRecovery("Audio input arrived while the live session was reconnecting.");
             return;
         }
 
-        await SendBufferedRealtimeInputAsync(session, buffered, cancellationToken);
+        await SendRealtimeInputAsync(
+            session,
+            new LiveSendRealtimeInputParameters
+            {
+                Audio = new Blob
+                {
+                    Data = chunk.Bytes.ToArray(),
+                    MimeType = chunk.MimeType
+                }
+            },
+            "audio",
+            cancellationToken);
     }
 
     public async Task SendVideoFrameAsync(ScreenshotCapture frame, CancellationToken cancellationToken = default)
     {
-        if (!_shouldBeRunning)
-        {
-            return;
-        }
-
-        var buffered = BufferVideo(frame);
         var session = _session;
-        if (session is null)
+        if (!_shouldBeRunning || session is null)
         {
-            QueueRecovery("Screen input arrived while the live session was reconnecting.");
             return;
         }
 
-        await SendBufferedRealtimeInputAsync(session, buffered, cancellationToken);
+        await SendRealtimeInputAsync(
+            session,
+            new LiveSendRealtimeInputParameters
+            {
+                Video = new Blob
+                {
+                    Data = frame.Bytes.ToArray(),
+                    MimeType = frame.MimeType
+                }
+            },
+            "video",
+            cancellationToken);
     }
 
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {
         _shouldBeRunning = false;
-
         _serviceLifetimeCts?.Cancel();
 
         await DisposeCurrentSessionAsync(resetTranscripts: true, cancellationToken);
@@ -142,8 +151,8 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
         _serviceLifetimeCts?.Dispose();
         _serviceLifetimeCts = null;
         _activeSettings = null;
+        ResetConnectionState();
 
-        ClearRecoveryState();
         LogSession("Live", "Stop completed.");
         _diagnosticsLogService.EndSession("Stopped");
         SessionStateChanged?.Invoke(false);
@@ -158,30 +167,24 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
 
     private async Task ConnectAsync(AppSettings settings, bool allowResumption, CancellationToken cancellationToken)
     {
-        LogSession("Connect", $"Connecting | allowResumption={allowResumption} | apiVersion={(RequiresV1Alpha(settings) ? "v1alpha" : "v1beta")} | transparent={_transparentResumptionEnabled} | handlePresent={!string.IsNullOrWhiteSpace(_sessionResumptionHandle)}");
+        var apiVersion = RequiresV1Alpha(settings) ? "v1alpha" : "v1beta";
+        var resumptionHandle = allowResumption ? GetResumptionHandle() : null;
+
+        LogSession(
+            "Connect",
+            $"Connecting | apiVersion={apiVersion} | resume={!string.IsNullOrWhiteSpace(resumptionHandle)} | search={_googleSearchEnabled} | model={settings.LiveModel}");
+
         _client?.Dispose();
         _client = new Client(
             apiKey: settings.ApiKey,
             httpOptions: new HttpOptions
             {
-                ApiVersion = RequiresV1Alpha(settings) ? "v1alpha" : "v1beta"
+                ApiVersion = apiVersion
             });
 
-        var config = BuildConnectConfig(settings, allowResumption);
-
-        try
-        {
-            _session = await _client.Live.ConnectAsync(settings.LiveModel, config, cancellationToken);
-        }
-        catch (Exception ex) when (_transparentResumptionEnabled && SupportsTransparentFallback(ex))
-        {
-            _transparentResumptionEnabled = false;
-            LogSession("Connect", $"Transparent resumption rejected by Gemini. Falling back. | {ex.Message}");
-            PublishStatus("Gemini Live does not support transparent session resumption here. Falling back to handle-based recovery.");
-
-            config = BuildConnectConfig(settings, allowResumption);
-            _session = await _client.Live.ConnectAsync(settings.LiveModel, config, cancellationToken);
-        }
+        var config = BuildConnectConfig(settings, resumptionHandle);
+        _session = await _client.Live.ConnectAsync(settings.LiveModel, config, cancellationToken);
+        _connectedAt = DateTime.UtcNow;
 
         LogSession("Connect", "Connected.");
 
@@ -191,25 +194,23 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
         _receiveLoopTask = Task.Run(() => ReceiveLoopAsync(_receiveLoopCts.Token));
     }
 
-    private LiveConnectConfig BuildConnectConfig(AppSettings settings, bool allowResumption)
+    private LiveConnectConfig BuildConnectConfig(AppSettings settings, string? resumptionHandle)
     {
+        var isGemini31 = IsGemini31Live(settings.LiveModel);
+
         return new LiveConnectConfig
         {
             ResponseModalities = new List<Modality> { Modality.Audio },
-            EnableAffectiveDialog = settings.EnableAffectiveDialog,
+            EnableAffectiveDialog = !isGemini31 && settings.EnableAffectiveDialog ? true : null,
             MediaResolution = ParseMediaResolution(settings.MediaResolution),
-            Proactivity = settings.EnableProactiveAudio
-                ? new ProactivityConfig
-                {
-                    ProactiveAudio = true
-                }
+            Proactivity = !isGemini31 && settings.EnableProactiveAudio
+                ? new ProactivityConfig { ProactiveAudio = true }
                 : null,
             ContextWindowCompression = BuildContextWindowCompression(settings),
             ThinkingConfig = BuildThinkingConfig(settings),
             SessionResumption = new SessionResumptionConfig
             {
-                Handle = allowResumption ? _sessionResumptionHandle : null,
-                Transparent = _transparentResumptionEnabled ? true : null
+                Handle = resumptionHandle
             },
             SystemInstruction = new Content
             {
@@ -233,36 +234,45 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
                 AutomaticActivityDetection = new AutomaticActivityDetection
                 {
                     Disabled = false,
-                    PrefixPaddingMs = 40,
+                    StartOfSpeechSensitivity = isGemini31
+                        ? StartSensitivity.StartSensitivityLow
+                        : (StartSensitivity?)null,
+                    EndOfSpeechSensitivity = isGemini31
+                        ? EndSensitivity.EndSensitivityLow
+                        : (EndSensitivity?)null,
+                    PrefixPaddingMs = isGemini31 ? 80 : 40,
                     SilenceDurationMs = 600
                 }
             },
-            Tools = new List<Tool>
-            {
-                new()
+            Tools = _googleSearchEnabled
+                ? new List<Tool>
                 {
-                    GoogleSearch = new GoogleSearch()
+                    new()
+                    {
+                        GoogleSearch = new GoogleSearch()
+                    }
                 }
-            },
+                : null,
             InputAudioTranscription = new AudioTranscriptionConfig(),
             OutputAudioTranscription = new AudioTranscriptionConfig()
         };
     }
 
-    private async Task SendBufferedRealtimeInputAsync(
+    private async Task SendRealtimeInputAsync(
         AsyncSession session,
-        BufferedRealtimeInput buffered,
+        LiveSendRealtimeInputParameters realtimeInput,
+        string inputKind,
         CancellationToken cancellationToken)
     {
         await _sendLock.WaitAsync(cancellationToken);
         try
         {
-            if (!ReferenceEquals(session, _session))
+            if (!ReferenceEquals(session, _session) || !_shouldBeRunning)
             {
                 return;
             }
 
-            await session.SendRealtimeInputAsync(buffered.ToRealtimeInput(), cancellationToken);
+            await session.SendRealtimeInputAsync(realtimeInput, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -270,8 +280,16 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            StatusChanged?.Invoke($"Live session send interrupted: {ex.Message}. Attempting recovery...");
-            QueueRecovery($"Realtime send failed: {ex.Message}");
+            LogSessionException("Send", $"Realtime {inputKind} send failed.", ex);
+            var queued = QueueRecovery(
+                $"Realtime {inputKind} send failed: {ex.Message}",
+                unexpectedClose: true,
+                invalidArgumentClose: IsInvalidArgumentClose(ex));
+
+            if (queued)
+            {
+                PublishStatus($"Gemini Live send failed: {ex.Message}. Recovering with a clean connection...");
+            }
         }
         finally
         {
@@ -292,7 +310,6 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
         var turns = BuildRestoredConversationTurns(restoredConversation);
         if (turns.Count == 0)
         {
-            LogSession("Restore", "Resume requested, but no valid turns were produced from saved conversation.");
             return;
         }
 
@@ -302,26 +319,34 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
             Turns = turns,
             TurnComplete = false
         }, cancellationToken);
-
         PublishStatus("Loaded saved conversation context into Gemini Live.");
     }
 
     private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
     {
         LogSession("Receive", "Receive loop started.");
+
         try
         {
-            while (!cancellationToken.IsCancellationRequested && _session is not null)
+            while (!cancellationToken.IsCancellationRequested)
             {
-                var message = await _session.ReceiveAsync(cancellationToken);
+                var session = _session;
+                if (session is null)
+                {
+                    break;
+                }
+
+                var message = await session.ReceiveAsync(cancellationToken);
                 if (message is null)
                 {
                     if (_shouldBeRunning)
                     {
-                        LogSession("Receive", "ReceiveAsync returned null while session should still be running.");
-                        QueueRecovery("Gemini Live closed the websocket. Reconnecting...");
+                        LogSession("Receive", "Gemini Live websocket closed while the session should still be running.");
+                        QueueRecovery(
+                            "Gemini Live closed the websocket.",
+                            unexpectedClose: true,
+                            invalidArgumentClose: false);
                     }
-
                     break;
                 }
 
@@ -337,8 +362,15 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
             if (_shouldBeRunning)
             {
                 LogSessionException("Receive", "Receive loop failed.", ex);
-                PublishStatus($"Live session error: {ex.Message}. Attempting recovery...");
-                QueueRecovery($"Receive loop failed: {ex.Message}");
+                var queued = QueueRecovery(
+                    $"Receive loop failed: {ex.Message}",
+                    unexpectedClose: true,
+                    invalidArgumentClose: IsInvalidArgumentClose(ex));
+
+                if (queued)
+                {
+                    PublishStatus($"Gemini Live connection closed: {ex.Message}. Recovering with a clean connection...");
+                }
             }
         }
         finally
@@ -370,15 +402,27 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
 
         if (message.ServerContent?.Interrupted == true)
         {
-            LogSession("Server", "Generation interrupted.");
-            ResetOutputTranscript();
-            Interrupted?.Invoke();
+            var now = DateTime.UtcNow;
+            if ((now - _lastInterruptedAt) >= InterruptDebounce)
+            {
+                _lastInterruptedAt = now;
+                LogSession("Server", "Generation interrupted by detected user activity.");
+                ResetOutputTranscript();
+                Interrupted?.Invoke();
+            }
+            else
+            {
+                LogSession("Server", "Duplicate interrupt event suppressed.");
+            }
         }
 
         if (message.GoAway is not null)
         {
-            PublishStatus("Gemini Live asked this session to reconnect soon. Resuming automatically...");
-            QueueRecovery("Gemini Live sent GoAway.");
+            PublishStatus("Gemini Live requested a scheduled reconnect. Resuming with the latest handle...");
+            QueueRecovery(
+                "Gemini Live sent GoAway.",
+                unexpectedClose: false,
+                invalidArgumentClose: false);
         }
 
         var parts = message.ServerContent?.ModelTurn?.Parts;
@@ -395,7 +439,6 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
 
                 if (part.InlineData?.Data is { Length: > 0 } audioBytes)
                 {
-                    LogReceivedAudioSummary(audioBytes.Length);
                     AudioReceived?.Invoke(audioBytes);
                 }
             }
@@ -407,81 +450,114 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
         }
     }
 
-    private void QueueRecovery(string reason)
+    private bool QueueRecovery(
+        string reason,
+        bool unexpectedClose,
+        bool invalidArgumentClose)
     {
         if (!_shouldBeRunning || _activeSettings is null || _serviceLifetimeCts?.IsCancellationRequested == true)
         {
-            return;
+            return false;
         }
 
         if (Interlocked.CompareExchange(ref _recoveryInFlight, 1, 0) != 0)
         {
             LogSession("Recover", $"Recovery already in flight. Ignored duplicate trigger | reason={reason}");
-            return;
+            return false;
         }
 
-        _ = RecoverSessionAsync(reason);
+        var isGemini31 = IsGemini31Live(_activeSettings.LiveModel);
+        var forceFreshSession = unexpectedClose && isGemini31;
+
+        if (unexpectedClose && RegisterUnexpectedClose())
+        {
+            _ = StopAfterRepeatedCloseAsync(reason);
+            return true;
+        }
+
+        if (isGemini31 && _googleSearchEnabled &&
+            (invalidArgumentClose || (unexpectedClose && _rapidCloseCount >= 2)))
+        {
+            _googleSearchEnabled = false;
+            forceFreshSession = true;
+            ClearResumptionHandle();
+            LogSession(
+                "Compat",
+                "Google Search disabled for this live session after repeated/invalid-argument Gemini 3.1 closes. This prevents a search-triggered resume loop. Restart Live to re-enable search.");
+            PublishStatus(
+                "Gemini 3.1 closed during this session. Retrying fresh with Google Search temporarily disabled to prevent the close/reconnect loop.");
+        }
+
+        if (forceFreshSession)
+        {
+            ClearResumptionHandle();
+        }
+
+        _ = RecoverSessionAsync(reason, forceFreshSession);
+        return true;
     }
 
-    private async Task RecoverSessionAsync(string reason)
+    private async Task RecoverSessionAsync(string reason, bool forceFreshSession)
     {
         var reconnectLockHeld = false;
         try
         {
-            if (!_shouldBeRunning || _activeSettings is null || _serviceLifetimeCts?.IsCancellationRequested == true)
+            var settings = _activeSettings;
+            if (!_shouldBeRunning || settings is null || _serviceLifetimeCts?.IsCancellationRequested == true)
             {
                 return;
             }
 
-            var lifetimeToken = _serviceLifetimeCts?.Token ?? CancellationToken.None;
+            var lifetimeToken = _serviceLifetimeCts.Token;
             await _reconnectLock.WaitAsync(lifetimeToken);
             reconnectLockHeld = true;
 
-            var attempt = 0;
-            while (_shouldBeRunning && _activeSettings is not null && !lifetimeToken.IsCancellationRequested)
+            await DisposeCurrentSessionAsync(resetTranscripts: false, CancellationToken.None);
+            lifetimeToken.ThrowIfCancellationRequested();
+
+            for (var attempt = 1; attempt <= MaxReconnectAttempts; attempt++)
             {
-                attempt++;
                 try
                 {
+                    var canResume = !forceFreshSession && !string.IsNullOrWhiteSpace(GetResumptionHandle());
                     PublishStatus(attempt == 1
-                        ? $"Recovering live session: {reason}"
-                        : $"Reconnect attempt {attempt} after: {reason}");
-                    LogSession("Recover", $"Reconnect attempt {attempt} started | reason={reason}");
+                        ? $"Recovering Gemini Live: {reason}"
+                        : $"Reconnect attempt {attempt}/{MaxReconnectAttempts}: {reason}");
+                    LogSession(
+                        "Recover",
+                        $"Reconnect attempt {attempt} | fresh={forceFreshSession} | resume={canResume} | search={_googleSearchEnabled}");
 
-                    await DisposeCurrentSessionAsync(resetTranscripts: false, CancellationToken.None);
-                    lifetimeToken.ThrowIfCancellationRequested();
-                    var canResume = !string.IsNullOrWhiteSpace(_sessionResumptionHandle);
-                    await ConnectAsync(_activeSettings, allowResumption: canResume, lifetimeToken);
-                    lifetimeToken.ThrowIfCancellationRequested();
-                    if (_transparentResumptionEnabled)
-                    {
-                        await ReplayBufferedRealtimeInputsAsync(lifetimeToken);
-                    }
-                    else
-                    {
-                        TrimBufferedInputsAfterOpaqueReconnect();
-                    }
-
-                    if (!_shouldBeRunning || lifetimeToken.IsCancellationRequested)
-                    {
-                        await DisposeCurrentSessionAsync(resetTranscripts: false, CancellationToken.None);
-                        return;
-                    }
-
-                    PublishStatus(string.IsNullOrWhiteSpace(_sessionResumptionHandle)
-                        ? "Live session reconnected with a fresh session."
-                        : _transparentResumptionEnabled
-                            ? "Live session reconnected and resumed."
-                            : "Live session reconnected and resumed context.");
-                    LogSession("Recover", $"Reconnect attempt {attempt} succeeded | resumed={canResume} | handlePresent={!string.IsNullOrWhiteSpace(_sessionResumptionHandle)} | transparent={_transparentResumptionEnabled}");
+                    await ConnectAsync(settings, allowResumption: canResume, lifetimeToken);
+                    PublishStatus(canResume
+                        ? "Gemini Live reconnected and resumed."
+                        : "Gemini Live reconnected with a clean session.");
+                    return;
+                }
+                catch (OperationCanceledException) when (lifetimeToken.IsCancellationRequested)
+                {
                     return;
                 }
                 catch (Exception ex)
                 {
                     LogSessionException("Recover", $"Reconnect attempt {attempt} failed.", ex);
-                    PublishStatus($"Reconnect attempt {attempt} failed: {ex.Message}. Retrying...");
-                    var delayMs = Math.Min(5000, 750 * attempt);
-                    await Task.Delay(delayMs, lifetimeToken);
+
+                    if (IsGemini31Live(settings.LiveModel) &&
+                        _googleSearchEnabled &&
+                        IsInvalidArgumentClose(ex))
+                    {
+                        _googleSearchEnabled = false;
+                        forceFreshSession = true;
+                        ClearResumptionHandle();
+                        LogSession("Compat", "Reconnect got invalid argument; retrying Gemini 3.1 without Google Search and without resuming the rejected session.");
+                    }
+
+                    if (attempt >= MaxReconnectAttempts)
+                    {
+                        await StopAfterReconnectFailureAsync(ex.Message);
+                        return;
+                    }
+
+                    await Task.Delay(Math.Min(5000, 750 * attempt), lifetimeToken);
                 }
             }
         }
@@ -499,67 +575,86 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
         }
     }
 
-    private async Task ReplayBufferedRealtimeInputsAsync(CancellationToken cancellationToken)
+    private bool RegisterUnexpectedClose()
     {
-        var session = _session;
-        if (session is null)
+        var now = DateTime.UtcNow;
+        var age = _connectedAt == DateTime.MinValue
+            ? TimeSpan.Zero
+            : now - _connectedAt;
+
+        if (age <= RapidCloseWindow)
         {
-            return;
+            _rapidCloseCount++;
+        }
+        else
+        {
+            _rapidCloseCount = 1;
         }
 
-        List<BufferedRealtimeInput> replayItems;
-        lock (_bufferLock)
-        {
-            replayItems = _pendingRealtimeInputs
-                .Where(item => item.Index > _lastConsumedClientMessageIndex)
-                .OrderBy(item => item.Index)
-                .ToList();
-        }
+        LogSession(
+            "Recover",
+            $"Unexpected close | connectionAge={age.TotalSeconds:0.0}s | rapidCloseCount={_rapidCloseCount}/{RapidCloseLimit}");
 
-        if (replayItems.Count == 0)
-        {
-            LogSession("Recover", "No buffered realtime inputs needed replay.");
-            return;
-        }
+        return _rapidCloseCount >= RapidCloseLimit;
+    }
 
-        LogSession("Recover", $"Replaying buffered realtime inputs | count={replayItems.Count} | lastConsumed={_lastConsumedClientMessageIndex}");
-
-        await _sendLock.WaitAsync(cancellationToken);
+    private async Task StopAfterRepeatedCloseAsync(string reason)
+    {
         try
         {
-            foreach (var item in replayItems)
-            {
-                if (!ReferenceEquals(session, _session))
-                {
-                    return;
-                }
+            PublishStatus(
+                "Gemini Live closed repeatedly. Auto-reconnect was stopped instead of looping. Press Start Session to try again.");
+            LogSession("Recover", $"Circuit breaker opened after repeated closes | reason={reason}");
 
-                await session.SendRealtimeInputAsync(item.ToRealtimeInput(), cancellationToken);
-            }
+            _shouldBeRunning = false;
+            _serviceLifetimeCts?.Cancel();
+            await DisposeCurrentSessionAsync(resetTranscripts: false, CancellationToken.None);
+            _diagnosticsLogService.EndSession("Repeated Gemini Live closes");
+            SessionStateChanged?.Invoke(false);
         }
         finally
         {
-            _sendLock.Release();
+            Interlocked.Exchange(ref _recoveryInFlight, 0);
         }
+    }
+
+    private async Task StopAfterReconnectFailureAsync(string message)
+    {
+        PublishStatus(
+            $"Gemini Live could not reconnect after {MaxReconnectAttempts} attempts: {message}. Session stopped.");
+        _shouldBeRunning = false;
+        _serviceLifetimeCts?.Cancel();
+        await DisposeCurrentSessionAsync(resetTranscripts: false, CancellationToken.None);
+        _diagnosticsLogService.EndSession("Reconnect failed");
+        SessionStateChanged?.Invoke(false);
     }
 
     private async Task DisposeCurrentSessionAsync(bool resetTranscripts, CancellationToken cancellationToken)
     {
         _receiveLoopCts?.Cancel();
 
-        if (_session is not null)
+        var session = _session;
+        _session = null;
+
+        if (session is not null)
         {
             try
             {
-                await _session.CloseAsync();
+                await session.CloseAsync();
             }
-            catch
+            catch (Exception ex)
             {
-                LogSession("Dispose", "Session close raised and was ignored.");
+                LogSession("Dispose", $"Session close ignored: {ex.Message}");
             }
 
-            await _session.DisposeAsync();
-            _session = null;
+            try
+            {
+                await session.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                LogSession("Dispose", $"Session dispose ignored: {ex.Message}");
+            }
         }
 
         if (_receiveLoopTask is not null)
@@ -571,13 +666,11 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
             catch
             {
             }
-
             _receiveLoopTask = null;
         }
 
         _receiveLoopCts?.Dispose();
         _receiveLoopCts = null;
-
         _client?.Dispose();
         _client = null;
 
@@ -591,7 +684,7 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
 
     private void UpdateSessionResumptionState(LiveServerSessionResumptionUpdate update)
     {
-        lock (_bufferLock)
+        lock (_resumptionLock)
         {
             if (update.Resumable == true && !string.IsNullOrWhiteSpace(update.NewHandle))
             {
@@ -601,81 +694,37 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
             {
                 _sessionResumptionHandle = null;
             }
-
-            if (update.LastConsumedClientMessageIndex is { } consumedIndex)
-            {
-                _lastConsumedClientMessageIndex = Convert.ToInt64(consumedIndex);
-                _pendingRealtimeInputs.RemoveAll(item => item.Index <= _lastConsumedClientMessageIndex);
-            }
         }
 
-        LogSession("Resumption", $"Update | resumable={update.Resumable} | newHandlePresent={!string.IsNullOrWhiteSpace(update.NewHandle)} | storedHandlePresent={!string.IsNullOrWhiteSpace(_sessionResumptionHandle)} | lastConsumed={update.LastConsumedClientMessageIndex?.ToString() ?? "n/a"}");
+        LogSession(
+            "Resumption",
+            $"Update | resumable={update.Resumable} | handlePresent={!string.IsNullOrWhiteSpace(update.NewHandle)}");
     }
 
-    private BufferedRealtimeInput BufferAudio(AudioChunk chunk)
+    private string? GetResumptionHandle()
     {
-        var blob = new Blob
+        lock (_resumptionLock)
         {
-            Data = chunk.Bytes.ToArray(),
-            MimeType = chunk.MimeType
-        };
-
-        return BufferRealtimeInput(audio: blob, video: null);
-    }
-
-    private BufferedRealtimeInput BufferVideo(ScreenshotCapture frame)
-    {
-        var blob = new Blob
-        {
-            Data = frame.Bytes.ToArray(),
-            MimeType = frame.MimeType
-        };
-
-        return BufferRealtimeInput(audio: null, video: blob);
-    }
-
-    private BufferedRealtimeInput BufferRealtimeInput(Blob? audio, Blob? video)
-    {
-        lock (_bufferLock)
-        {
-            var buffered = new BufferedRealtimeInput(++_nextClientMessageIndex, audio, video);
-            _pendingRealtimeInputs.Add(buffered);
-
-            if (_pendingRealtimeInputs.Count > MaxBufferedRealtimeInputs)
-            {
-                _pendingRealtimeInputs.RemoveAt(0);
-            }
-
-            UpdateBufferedInputLogState(audio is not null, video is not null, buffered.Index, _pendingRealtimeInputs.Count);
-
-            return buffered;
+            return _sessionResumptionHandle;
         }
     }
 
-    private void ClearRecoveryState()
+    private void ClearResumptionHandle()
     {
-        lock (_bufferLock)
+        lock (_resumptionLock)
         {
-            _pendingRealtimeInputs.Clear();
             _sessionResumptionHandle = null;
-            _nextClientMessageIndex = 0;
-            _lastConsumedClientMessageIndex = -1;
         }
-
-        _transparentResumptionEnabled = true;
-        Interlocked.Exchange(ref _recoveryInFlight, 0);
-        LogSession("Recover", "Recovery state cleared.");
     }
 
-    private void TrimBufferedInputsAfterOpaqueReconnect()
+    private void ResetConnectionState()
     {
-        lock (_bufferLock)
-        {
-            _pendingRealtimeInputs.Clear();
-            _lastConsumedClientMessageIndex = _nextClientMessageIndex;
-        }
-
-        LogSession("Recover", "Transparent replay unavailable. Cleared buffered realtime inputs after reconnect.");
+        ClearResumptionHandle();
+        _googleSearchEnabled = true;
+        _connectedAt = DateTime.MinValue;
+        _rapidCloseCount = 0;
+        _lastInterruptedAt = DateTime.MinValue;
+        Interlocked.Exchange(ref _recoveryInFlight, 0);
     }
 
     private void PublishInputTranscript(string chunk)
@@ -759,12 +808,7 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
             return incoming;
         }
 
-        if (existing.StartsWith(incoming, StringComparison.Ordinal))
-        {
-            return existing;
-        }
-
-        if (existing.EndsWith(incoming, StringComparison.Ordinal))
+        if (existing.StartsWith(incoming, StringComparison.Ordinal) || existing.EndsWith(incoming, StringComparison.Ordinal))
         {
             return existing;
         }
@@ -782,7 +826,8 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
         return existing + " " + incoming;
     }
 
-    private static List<Content> BuildRestoredConversationTurns(IReadOnlyList<ConversationLogEntryRecord> restoredConversation)
+    private static List<Content> BuildRestoredConversationTurns(
+        IReadOnlyList<ConversationLogEntryRecord> restoredConversation)
     {
         var turns = new List<Content>();
         Content? current = null;
@@ -879,8 +924,25 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
         }
     }
 
+    private static bool IsGemini31Live(string? model)
+    {
+        return !string.IsNullOrWhiteSpace(model) &&
+               model.Contains("gemini-3.1-flash-live", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsThinkingDisabled(AppSettings settings)
+    {
+        return settings.EnableThinkingConfig &&
+               string.Equals(settings.ThinkingMode, "disabled", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool RequiresV1Alpha(AppSettings settings)
     {
+        if (IsGemini31Live(settings.LiveModel))
+        {
+            return false;
+        }
+
         return settings.EnableAffectiveDialog || settings.EnableProactiveAudio;
     }
 
@@ -911,6 +973,19 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
         if (!settings.EnableThinkingConfig || mode == "default")
         {
             return null;
+        }
+
+        if (IsGemini31Live(settings.LiveModel))
+        {
+            var level = mode == "disabled"
+                ? ThinkingLevel.Minimal
+                : ParseThinkingLevel(settings.ThinkingLevel) ?? ThinkingLevel.Minimal;
+
+            return new ThinkingConfig
+            {
+                IncludeThoughts = settings.IncludeThoughts ? true : null,
+                ThinkingLevel = level
+            };
         }
 
         if (mode == "disabled")
@@ -954,9 +1029,11 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
         };
     }
 
-    private static bool SupportsTransparentFallback(Exception ex)
+    private static bool IsInvalidArgumentClose(Exception ex)
     {
-        return ex.Message.Contains(TransparentUnsupportedMessage, StringComparison.OrdinalIgnoreCase);
+        return ex.Message.Contains(InvalidArgumentMarker, StringComparison.OrdinalIgnoreCase) ||
+               ex.Message.Contains("InvalidPayloadData", StringComparison.OrdinalIgnoreCase) ||
+               ex.InnerException is not null && IsInvalidArgumentClose(ex.InnerException);
     }
 
     private void PublishStatus(string message)
@@ -977,59 +1054,6 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
             $"Message | goAway={message.GoAway is not null} | interrupted={message.ServerContent?.Interrupted == true} | turnComplete={message.ServerContent?.TurnComplete == true} | generationComplete={message.ServerContent?.GenerationComplete == true} | inputText={(message.ServerContent?.InputTranscription?.Text?.Length ?? 0)} chars | outputText={(message.ServerContent?.OutputTranscription?.Text?.Length ?? 0)} chars | textParts={textParts} | thoughtParts={thoughtParts} | audioParts={audioParts}");
     }
 
-    private void ResetDiagnosticsCounters()
-    {
-        _lastBufferedInputLogAt = DateTime.MinValue;
-        _lastReceivedAudioLogAt = DateTime.MinValue;
-        _bufferedAudioChunksSinceLastLog = 0;
-        _bufferedVideoFramesSinceLastLog = 0;
-        _receivedAudioChunksSinceLastLog = 0;
-    }
-
-    private void UpdateBufferedInputLogState(bool hasAudio, bool hasVideo, long index, int pendingCount)
-    {
-        var now = DateTime.UtcNow;
-
-        if (hasAudio)
-        {
-            _bufferedAudioChunksSinceLastLog++;
-        }
-
-        if (hasVideo)
-        {
-            _bufferedVideoFramesSinceLastLog++;
-        }
-
-        if ((now - _lastBufferedInputLogAt) < TimeSpan.FromSeconds(5))
-        {
-            return;
-        }
-
-        LogSession(
-            "Buffer",
-            $"Buffered realtime input summary | latestIndex={index} | pending={pendingCount} | audioChunks={_bufferedAudioChunksSinceLastLog} | videoFrames={_bufferedVideoFramesSinceLastLog}");
-        _bufferedAudioChunksSinceLastLog = 0;
-        _bufferedVideoFramesSinceLastLog = 0;
-        _lastBufferedInputLogAt = now;
-    }
-
-    private void LogReceivedAudioSummary(int bytes)
-    {
-        var now = DateTime.UtcNow;
-        _receivedAudioChunksSinceLastLog++;
-
-        if ((now - _lastReceivedAudioLogAt) < TimeSpan.FromSeconds(5))
-        {
-            return;
-        }
-
-        LogSession(
-            "Audio",
-            $"Received output audio summary | chunks={_receivedAudioChunksSinceLastLog} | lastChunkBytes={bytes}");
-        _receivedAudioChunksSinceLastLog = 0;
-        _lastReceivedAudioLogAt = now;
-    }
-
     private void LogSession(string category, string message)
     {
         _diagnosticsLogService.LogSession(category, message);
@@ -1038,25 +1062,5 @@ public sealed class GeminiLiveSessionService : IAsyncDisposable
     private void LogSessionException(string category, string message, Exception exception)
     {
         _diagnosticsLogService.LogSessionException(category, message, exception);
-    }
-
-    private sealed record BufferedRealtimeInput(long Index, Blob? Audio, Blob? Video)
-    {
-        public LiveSendRealtimeInputParameters ToRealtimeInput()
-        {
-            return new LiveSendRealtimeInputParameters
-            {
-                Audio = Audio is null ? null : new Blob
-                {
-                    Data = Audio.Data is null ? Array.Empty<byte>() : Audio.Data.ToArray(),
-                    MimeType = Audio.MimeType
-                },
-                Video = Video is null ? null : new Blob
-                {
-                    Data = Video.Data is null ? Array.Empty<byte>() : Video.Data.ToArray(),
-                    MimeType = Video.MimeType
-                }
-            };
-        }
     }
 }
