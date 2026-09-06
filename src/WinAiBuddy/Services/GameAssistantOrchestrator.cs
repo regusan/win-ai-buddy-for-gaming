@@ -52,6 +52,9 @@ public sealed class GameAssistantOrchestrator : IAsyncDisposable
             }
             else if (!isRunning && wasRunning)
             {
+                StopScreenLoop();
+                _audioRecordingService.StopStreaming();
+                _speechPlaybackService.Clear();
                 _ = _overlayService.ShowMessageAsync("Live coaching stopped.", TimeSpan.FromSeconds(3));
             }
         };
@@ -71,11 +74,8 @@ public sealed class GameAssistantOrchestrator : IAsyncDisposable
     }
 
     public event Action<string>? StatusChanged;
-
     public event Action<bool>? SessionStateChanged;
-
     public event Action<string>? InputTranscriptionChanged;
-
     public event Action<string>? OutputTranscriptionChanged;
 
     public async Task StartLiveSessionAsync(
