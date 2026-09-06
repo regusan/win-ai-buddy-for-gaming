@@ -6,7 +6,7 @@ public sealed class AppSettings
 
     public string ApiKey { get; set; } = string.Empty;
 
-    public string LiveModel { get; set; } = "gemini-2.5-flash-native-audio-preview-12-2025";
+    public string LiveModel { get; set; } = "gemini-3.1-flash-live-preview";
 
     public bool EnableAffectiveDialog { get; set; }
 
